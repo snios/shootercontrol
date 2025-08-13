@@ -3,8 +3,14 @@
 #include <ArduinoJson.h>
 #include <FS.h>
 
+// =========================
+// Firmware info
+// =========================
+#define FW_VERSION "D1Mini-AP-commands v1.1 (2025-08-12)"
 
+// =========================
 // AP Settings
+// =========================
 const char* ssid = "D1MiniAP";
 const char* password = "12345678";
 
@@ -19,32 +25,68 @@ struct Command {
   bool inProgress;
 };
 
+// =========================
+// Pin mapping
+// JSON pin numbers -> D-labels on Wemos D1 Mini -> GPIO
+//
+//  1 -> D1 -> GPIO5
+//  2 -> D2 -> GPIO4
+//  3 -> D3 -> GPIO0
+//  4 -> D4 -> GPIO2
+//  5 -> D5 -> GPIO14   (extra, ifall du vill använda fler)
+//  6 -> D6 -> GPIO12
+//  7 -> D7 -> GPIO13
+//  8 -> D8 -> GPIO15
+// Default: returnera originalvärdet (om du sätter GPIO direkt i JSON)
+// =========================
+int mapPinNumber(int jsonPin) {
+  switch (jsonPin) {
+    case 1: return 5;   // D1
+    case 2: return 4;   // D2
+    case 3: return 0;   // D3
+    case 4: return 2;   // D4
+    case 5: return 14;  // D5
+    case 6: return 12;  // D6
+    case 7: return 13;  // D7
+    case 8: return 15;  // D8
+    default: return jsonPin; // Om du redan anger GPIO direkt
+  }
+}
+
+void handlePostRequest();
+void handleRunRequest();
+void saveData(const char* filename, const String& data);
+void runProgram(int programId);
+String loadData(const char* filename);
+
 void setup() {
   Serial.begin(74880);
+  delay(50);
+  Serial.println();
+  Serial.println(FW_VERSION);
 
   // Initialize SPIFFS (Storage)
   if (!SPIFFS.begin()) {
     Serial.println("Failed to mount file system");
     return;
   }
-  
+
   // Set up the AP mode
   WiFi.softAP(ssid, password);
   Serial.println("Access Point started");
 
-  // Define a route that handles POST requests
+  // Routes
   server.on("/program", HTTP_POST, handlePostRequest);
-  
-  // Define the route to run the saved program
   server.on("/run", HTTP_GET, handleRunRequest);
-  
+
+  // Firmware version endpoint
+  server.on("/version", HTTP_GET, []() {
+    server.send(200, "text/plain", FW_VERSION);
+  });
+
   // Start the server
   server.begin();
   Serial.println("Server started");
-
-  // This is done based on program beeing run now..
-  //pinMode(5, OUTPUT);
-  //pinMode(4, OUTPUT);
 }
 
 void loop() {
@@ -53,66 +95,66 @@ void loop() {
 }
 
 void handlePostRequest() {
-
   if (server.hasArg("id")) {
     int programId = server.arg("id").toInt();
 
-     String jsonString = server.arg("plain");
-  Serial.println("Received JSON: " + jsonString);
+    String jsonString = server.arg("plain");
+    Serial.println("Received JSON: " + jsonString);
 
-  // Parse the JSON
-  StaticJsonDocument<1024> doc;
-  DeserializationError error = deserializeJson(doc, jsonString);
+    // Parse the JSON (validering)
+    StaticJsonDocument<1024> doc;
+    DeserializationError error = deserializeJson(doc, jsonString);
+    if (error) {
+      Serial.print("JSON Parsing failed: ");
+      Serial.println(error.c_str());
+      server.send(400, "text/plain", "Invalid JSON");
+      return;
+    }
 
-  if (error) {
-    Serial.print("JSON Parsing failed: ");
-    Serial.println(error.c_str());
-    server.send(400, "text/plain", "Invalid JSON");
+    // Filnamn: /<id>.json
+    String filename = "/" + String(programId) + ".json";
+
+    // Spara JSON i SPIFFS
+    saveData(filename.c_str(), jsonString);
+
+    // Svar
+    server.send(200, "text/plain", "Commands executed and saved");
     return;
-  }
-  // Get the program ID from the URL path
-  //String programId = server.uri().substring(server.uri().lastIndexOf("/") + 1);
-  String filename = "/" + String(programId) + ".json";
-
-  // Save the JSON data to SPIFFS with the generated filename
-  saveData(filename.c_str(), jsonString);
-
-  // Send a response back
-  server.send(200, "text/plain", "Commands executed and saved");
-  return;
   } else {
     server.send(400, "text/plain", "Missing program parameter");
     return;
   }
- 
 }
 
 void handleRunRequest() {
-  // Get the pin parameter from the query string
   if (server.hasArg("program")) {
     int programId = server.arg("program").toInt();
 
     if (programId == 0) {
-      int pins[] = {5, 4, 0, 2};  // GPIO numbers for D1, D2, D3, D4
+      // Specialprogram: toggla D1..D4 via mappning (1..4)
+      int pins[] = {
+        mapPinNumber(1), // D1 -> GPIO5
+        mapPinNumber(2), // D2 -> GPIO4
+        mapPinNumber(3), // D3 -> GPIO0
+        mapPinNumber(4)  // D4 -> GPIO2
+      };
 
       for (int i = 0; i < 4; i++) {
-        pinMode(pins[i], OUTPUT); // Ensure the pin is set as output
-        int pinState = digitalRead(pins[i]);  // Read the current state of the pin
-        digitalWrite(pins[i], !pinState);     // Invert the pin state
+        pinMode(pins[i], OUTPUT); // säkerställ output
+        int pinState = digitalRead(pins[i]);  // läs current state
+        digitalWrite(pins[i], !pinState);     // invertera state
       }
       server.send(200, "text/plain", "Program " + String(programId) + " executed");
       return;
     }
 
-    // Run the saved program for the specified pin
+    // Kör sparat program
     runProgram(programId);
-
     server.send(200, "text/plain", "Program " + String(programId) + " executed");
   } else {
     server.send(400, "text/plain", "Missing program parameter");
   }
 }
-
 
 void saveData(const char* filename, const String& data) {
   File file = SPIFFS.open(filename, "w");
@@ -136,7 +178,7 @@ void runProgram(int programId) {
     // Parse and run the saved JSON commands
     Serial.println("Data:");
     Serial.println(savedJson);
-    StaticJsonDocument<1024> doc;  // Increased buffer size to accommodate larger JSON data
+    StaticJsonDocument<1024> doc; // buffert
     DeserializationError error = deserializeJson(doc, savedJson);
 
     if (!error) {
@@ -144,7 +186,7 @@ void runProgram(int programId) {
 
       // Create an array to hold the state of each pin
       struct PinState {
-        int pin;                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              
+        int pin; // <- detta blir GPIO efter mappning
         int currentCommandIndex;
         unsigned long lastCommandTime;
         unsigned long commandDuration;
@@ -153,26 +195,29 @@ void runProgram(int programId) {
 
       PinState pinStates[pinArray.size()];
 
-      // Initialize pin states
+      // Initiera pin-states
       int index = 0;
       for (JsonObject pinObj : pinArray) {
-        pinStates[index].pin = pinObj["pin"];
-        digitalWrite(pinStates[index].pin, HIGH);  // Ensure the pin starts high (Relay board used is active when low.)
-        pinMode(pinStates[index].pin, OUTPUT);  // Set the pin as output
+        int requestedPin = pinObj["pin"];           // JSON-värde (1..8 eller GPIO)
+        int mappedPin    = mapPinNumber(requestedPin); // mappa till GPIO
+
+        pinStates[index].pin = mappedPin;
+        digitalWrite(pinStates[index].pin, HIGH);   // start HIGH (aktiv-låg reläkort)
+        pinMode(pinStates[index].pin, OUTPUT);
         pinStates[index].currentCommandIndex = 0;
         pinStates[index].lastCommandTime = millis();
-        pinStates[index].commandDuration = 0;  // Initialize to zero as no command is set yet
+        pinStates[index].commandDuration = 0;
         pinStates[index].isFinished = false;
         index++;
       }
 
-      // Main loop to process commands in parallel
+      // Kör kommandon parallellt
       while (true) {
-        bool allPinsFinished = true;  // Assume all pins are finished initially
+        bool allPinsFinished = true;
 
         for (int i = 0; i < pinArray.size(); i++) {
           if (pinStates[i].isFinished) {
-            continue;  // Skip this pin if it has finished its commands
+            continue;
           }
 
           JsonObject pinObj = pinArray[i];
@@ -182,30 +227,29 @@ void runProgram(int programId) {
             JsonObject command = commands[pinStates[i].currentCommandIndex];
             int duration = command["duration"];
             int cmd = command["command"];
-            cmd = !cmd; //revert command
+            cmd = !cmd; // invertera (aktiv-låg)
+
             unsigned long currentTime = millis();
 
             // Check if it's time to update the pin state
             if (currentTime - pinStates[i].lastCommandTime >= pinStates[i].commandDuration) {
-              // Execute the command
               digitalWrite(pinStates[i].pin, cmd);
               Serial.print("Pin ");
               Serial.print(pinStates[i].pin);
               Serial.print(" set to ");
               Serial.println(cmd);
 
-              // Update state for the new command
-              pinStates[i].commandDuration = duration * 1000; // Set new command duration
-              pinStates[i].lastCommandTime = currentTime; // Update last command time
+              pinStates[i].commandDuration = duration * 1000UL;
+              pinStates[i].lastCommandTime = currentTime;
 
               // Move to the next command
               pinStates[i].currentCommandIndex++;
 
               if (pinStates[i].currentCommandIndex >= commands.size()) {
-                 // Wait for the last command duration to pass
-                  if (currentTime - pinStates[i].lastCommandTime >= pinStates[i].commandDuration) {
-                      pinStates[i].isFinished = true;
-                  }
+                // Vänta ut sista duration innan vi markerar klar
+                if (currentTime - pinStates[i].lastCommandTime >= pinStates[i].commandDuration) {
+                  pinStates[i].isFinished = true;
+                }
               }
             } else {
               allPinsFinished = false; // Wait for the current command to finish
@@ -228,13 +272,15 @@ void runProgram(int programId) {
       Serial.println("Program execution completed.");
       Serial.println("Waiting 3 seconds then resetting pins");
       delay(3000);
-      // Reset pins
+
+      // Reset pins till HIGH
       for (int i = 0; i < pinArray.size(); i++) {
         digitalWrite(pinStates[i].pin, HIGH);
         Serial.print("Pin ");
         Serial.print(pinStates[i].pin);
         Serial.println(" set to HIGH");
       }
+
       Serial.println("Program execution completed.");
     } else {
       Serial.println("Failed to parse saved JSON");
@@ -249,7 +295,7 @@ String loadData(const char* filename) {
   if (!file) {
     Serial.println("Failed to open file for reading");
     return "";
-  } 
+  }
 
   String data = file.readString();  // Read the entire file content
   file.close();
